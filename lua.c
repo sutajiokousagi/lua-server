@@ -1,5 +1,6 @@
 #include <fcgiapp.h>
 
+#include <stdint.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -14,17 +15,19 @@
 #include <lualib.h>
 
 #define LUA_MAXINPUT 512
-#define DEFAULT_STDIO_TIMEOUT 30
-#define MAX_STDIO_TIMEOUT 120
+#define DEFAULT_WEBIO_TIMEOUT 30
+#define MAX_WEBIO_TIMEOUT 120
+#define IN_CTRL_FD 3
+#define OUT_CTRL_FD 4
+#define HANDLE_OFFSET 3
 
 
 enum lua_operation {
     LUA_EVAL,
     LUA_OPEN,
     LUA_RUN,
-    LUA_STDIO,
+    LUA_WEBIO,
     LUA_STATE,
-    LUA_PING,
     LUA_BPADD,
     LUA_BPGET,
     LUA_BPDEL,
@@ -34,11 +37,18 @@ enum lua_operation {
 };
 
 enum lua_cmd {
-    LC_RUN,         // LUA should run some code
+    LC_RUN = 0,     // LUA should run some code
     LC_EVAL,        // LUA should eval the code and return the result
     LC_PAUSE,       // LUA should pause.  A breakpoint may be specified.
     LC_CONTINUE,    // LUA should continue where it left off.
     LC_ERROR,       // Indicates an error occurred
+
+    /* UI commands */
+    LC_NEWINPUT,    // Code has created a new input widget
+    LC_NEWOUTPUT,   // Code has created a new output widget
+    LC_INPUT,       // Web interface writing to input widget
+    LC_OUTPUT,      // Output widget has data to present
+
     LC_UNKNOWN,
 };
 
@@ -46,6 +56,7 @@ struct netv_lua_state {
     pid_t        pid;
     int          in_fd;
     int          out_fd;
+    int          err_fd;
     int          in_ctrl;
     int          out_ctrl;
     int          last_ping;
@@ -53,6 +64,25 @@ struct netv_lua_state {
     char         filename[1024];
     lua_State   *L;
 };
+
+struct netv_lua_widget {
+    uint8_t     type;
+    uint8_t     id;
+
+    uint32_t    val1;
+    uint32_t    val2;
+    uint32_t    val3;
+    uint32_t    val4;
+
+    uint32_t    x;
+    uint32_t    y;
+    uint32_t    width;
+    uint32_t    height;
+
+    uint32_t    color1;
+    uint32_t    color2;
+} __attribute__((__packed__));
+
 
 #define MAX_THREAD_ID 32
 static struct netv_lua_state nlua_states[MAX_THREAD_ID];
@@ -68,12 +98,10 @@ op_to_str(enum lua_operation op)
         return "LUA_OPEN";
     if (op == LUA_RUN)
         return "LUA_RUN";
-    if (op == LUA_STDIO)
-        return "LUA_STDIO";
+    if (op == LUA_WEBIO)
+        return "LUA_WEBIO";
     if (op == LUA_STATE)
         return "LUA_STATE";
-    if (op == LUA_PING)
-        return "LUA_PING";
     if (op == LUA_BPADD)
         return "LUA_BPADD";
     if (op == LUA_BPGET)
@@ -337,6 +365,9 @@ nlua_thread(int pin, int pout, char *project, char *filename)
     char cmd[4096];
     int cmd_size;
 
+    fprintf(stderr, "[err] Starting up Lua interpreter...\n");
+    fprintf(stdout, "[out] Starting up Lua interpreter...\n");
+
     lua_State *L;
     L = lua_open();
 
@@ -362,7 +393,7 @@ nlua_thread(int pin, int pout, char *project, char *filename)
 
         if (luaL_dofile(L, full_filename)) {
             cmd[0] = LC_ERROR;
-            cmd_size = snprintf(cmd+1, sizeof(cmd)-2, "Unable to load file: %s",
+            cmd_size = snprintf(cmd+1, sizeof(cmd)-2, "Error: %s",
                     lua_tostring(L, 1)) + 1;
             write(1, cmd, cmd_size);
         }
@@ -399,6 +430,7 @@ nlua_thread(int pin, int pout, char *project, char *filename)
 }
 
 
+/*
 static int
 tohex(char c)
 {
@@ -410,9 +442,44 @@ tohex(char c)
         return c-'A'+10;
     return c;
 }
+*/
+static int
+handle_ctrl(FCGX_Request *request, char *bfr, int sz)
+{
+    struct netv_lua_widget *w;
+    enum lua_cmd cmd;
+
+    cmd = *bfr;
+    bfr++;
+    sz--;
+
+    w = (struct netv_lua_widget *)bfr;
+    bfr += sizeof(*w);
+    sz -= sizeof(*w);
+
+    if (sz < 0) {
+        FCGX_FPrintF(request->out, "Content-Type: text/html\r\n"
+                                   "Status: 500\r\n"
+                                   "\r\n"
+                                   "Not enough data to handle ctrl interface\r\n");
+        return 0;
+    }
+
+    FCGX_FPrintF(request->out, "Content-Type: text/html\r\n"
+                               "X-Handle: %d\r\n"
+                               "X-%s: x=%d&y=%d&w=%d&h=%d&c1=%d&c2=%d&t=%d\r\n"
+                               "\r\n",
+                               w->id+HANDLE_OFFSET,
+                               (cmd==LC_INPUT || cmd==LC_NEWINPUT)?"Input":"Output",
+                               w->x, w->y, w->width, w->height,
+                               w->color1, w->color2, w->type);
+    if (cmd == LC_OUTPUT)
+        FCGX_PutStr(bfr, sz, request->out);
+    return 0;
+}
 
 static int
-nlua_stdio(FCGX_Request *request, char *enc, int id, int timeout)
+nlua_webio(FCGX_Request *request, char *arg, int id)
 {
     char *method = FCGX_GetParam("REQUEST_METHOD", request->envp);
 
@@ -420,11 +487,19 @@ nlua_stdio(FCGX_Request *request, char *enc, int id, int timeout)
     if (!strcmp(method, "POST")) {
         char bfr[8192];
         int bytes_read, bytes_written;
+        int timeout = DEFAULT_WEBIO_TIMEOUT;
+        if (*arg) {
+            timeout = strtoul(arg, NULL, 0);
+            if (timeout < 0 || timeout > MAX_WEBIO_TIMEOUT)
+                timeout = DEFAULT_WEBIO_TIMEOUT;
+        }
+
 
         FCGX_FPrintF(request->out, "Content-Type: text/html\r\n\r\n");
         while ( (bytes_read = FCGX_GetStr(bfr, sizeof(bfr), request->in)) > 0) {
             char *left = bfr;
 
+            /*
             if (enc && (!strcmp(enc, "hex") || !strcmp(enc, "hexecho"))) {
                 char *s = bfr;
                 int input=0, output=0;
@@ -440,6 +515,7 @@ nlua_stdio(FCGX_Request *request, char *enc, int id, int timeout)
 
             if (!strcmp(enc, "hexecho") || !strcmp(enc, "echo")) 
                 FCGX_PutStr(bfr, bytes_read, request->out);
+            */
 
             while (bytes_read > 0) {
                 bytes_written = write(nlua_states[id].in_fd, left, bytes_read);
@@ -456,20 +532,51 @@ nlua_stdio(FCGX_Request *request, char *enc, int id, int timeout)
     /* If it's not a POST, then read from stdout / stderr */
     else if (!strcmp(method, "GET")) {
         fd_set s;
-        struct timeval t = {timeout, 20000};
+        struct timeval t = {DEFAULT_WEBIO_TIMEOUT, 20000};
         int i;
+        int read_fd, handle_id;
+        int max;
 
         FD_ZERO(&s);
-        FD_SET(nlua_states[id].out_fd, &s);
 
-        i = select(nlua_states[id].out_fd+1, &s, NULL, NULL, &t);
+        FD_SET(nlua_states[id].out_fd, &s);
+        max = nlua_states[id].out_fd;
+
+        FD_SET(nlua_states[id].err_fd, &s);
+        if (max < nlua_states[id].err_fd)
+            max = nlua_states[id].err_fd;
+
+        FD_SET(nlua_states[id].out_ctrl, &s);
+        if (max < nlua_states[id].out_ctrl)
+            max = nlua_states[id].out_ctrl;
+
+        i = select(max+1, &s, NULL, NULL, &t);
         if (i > 0) {
-            char bfr[4096];
-            i = read(nlua_states[id].out_fd, bfr, sizeof(bfr));
+            char bfr[16384];
+
+            if (FD_ISSET(nlua_states[id].out_fd, &s)) {
+                read_fd = nlua_states[id].out_fd;
+                handle_id = 1;
+            }
+
+            else if (FD_ISSET(nlua_states[id].err_fd, &s)) {
+                read_fd = nlua_states[id].err_fd;
+                handle_id = 2;
+            }
+
+            else {
+                read_fd = nlua_states[id].out_ctrl;
+                handle_id = 3;
+            }
+
+            i = read(read_fd, bfr, sizeof(bfr));
             if (i == -1 && (errno == EINTR || errno == EAGAIN)) {
                 
                 /* Interrupted, but try again */
-                FCGX_FPrintF(request->out, "Content-Type: text/html\r\n\r\n");
+                FCGX_FPrintF(request->out, "Content-Type: text/html\r\n"
+                                           "X-Handle: %d\r\n"
+                                           "\r\n",
+                                           handle_id);
                 return 0;
             }
 
@@ -478,23 +585,39 @@ nlua_stdio(FCGX_Request *request, char *enc, int id, int timeout)
                 kill(nlua_states[id].pid, SIGKILL);
                 kill(nlua_states[id].pid, SIGTERM);
                 close(nlua_states[id].out_fd);
+                close(nlua_states[id].err_fd);
+                close(nlua_states[id].out_ctrl);
                 nlua_states[id].out_fd = -1;
+                nlua_states[id].err_fd = -1;
+                nlua_states[id].out_ctrl = -1;
                 nlua_pool_status[id] = 0;
-                return make_error(request, "Unable to write to stdin", errno);
+                return make_error(request, "Unable to read from handle", errno);
             }
+
+            /* The handle control fd requires special care */
+            else if (handle_id == 3)
+                return handle_ctrl(request, bfr, i);
 
             else if (i == 0) {
                 /* Connection closed */
                 close(nlua_states[id].out_fd);
+                close(nlua_states[id].err_fd);
+                close(nlua_states[id].out_ctrl);
                 nlua_states[id].out_fd = -1;
+                nlua_states[id].err_fd = -1;
+                nlua_states[id].out_ctrl = -1;
                 nlua_pool_status[id] = 0;
                 FCGX_FPrintF(request->out, "Content-Type: text/plain\r\n"
                                            "Status: 204\r\n"
-                                           "\r\n");
+                                           "X-Handle: %d\r\n"
+                                           "\r\n",
+                                           handle_id);
             }
             else {
                 FCGX_FPrintF(request->out, "Content-Type: text/plain\r\n"
-                                           "\r\n");
+                                           "X-Handle: %d\r\n"
+                                           "\r\n",
+                                           handle_id);
                 FCGX_PutStr(bfr, i, request->out);
             }
         }
@@ -508,11 +631,17 @@ nlua_stdio(FCGX_Request *request, char *enc, int id, int timeout)
             kill(nlua_states[id].pid, SIGKILL);
             kill(nlua_states[id].pid, SIGTERM);
             close(nlua_states[id].out_fd);
+            close(nlua_states[id].err_fd);
+            close(nlua_states[id].out_ctrl);
             nlua_states[id].out_fd = -1;
+            nlua_states[id].err_fd = -1;
+            nlua_states[id].out_ctrl = -1;
             nlua_pool_status[id] = 0;
             return make_error(request, "Unable to read from stdout", errno);
         }
     }
+
+
     else {
         return make_error(request, "Unrecognized http method", 0);
     }
@@ -526,7 +655,7 @@ nlua_open(FCGX_Request *request, char *project, char *filename)
 {
     int thread_id = -1;
     int i;
-    int p[4][2];
+    int p[5][2];
 
     signal(SIGTERM, nlua_sig);
 
@@ -553,6 +682,7 @@ nlua_open(FCGX_Request *request, char *project, char *filename)
     }
     pipe(p[2]);
     pipe(p[3]);
+    pipe(p[4]);
 
     nlua_states[thread_id].pid = fork();
 
@@ -565,48 +695,68 @@ nlua_open(FCGX_Request *request, char *project, char *filename)
         close(p[2][1]);
         close(p[3][0]);
         close(p[3][1]);
+        close(p[4][0]);
+        close(p[4][1]);
         nlua_pool_status[thread_id] = 0;
         return -errno;
     }
 
     else if(!nlua_states[thread_id].pid) {
-        /* Make p[1][1] be stdin */
-        if (p[1][1] != 1) {
-            dup2(p[1][1], fileno(stdout));
-            dup2(p[1][1], fileno(stderr));
-            close(p[1][1]);
-        }
 
         /* Make p[0][0] be stdin */
-        if (p[0][0] != 0) {
+        if (p[0][0] != fileno(stdin)) {
             dup2(p[0][0], fileno(stdin));
             close(p[0][0]);
         }
 
+        /* Make p[1][1] be stdout */
+        if (p[1][1] != fileno(stdout)) {
+            dup2(p[1][1], fileno(stdout));
+            close(p[1][1]);
+        }
+
+        if (p[2][1] != fileno(stderr)) {
+            dup2(p[2][1], fileno(stderr));
+            close(p[2][1]);
+        }
+
+        if (p[3][0] != IN_CTRL_FD) {
+            dup2(p[3][0], IN_CTRL_FD);
+            close(p[3][0]);
+        }
+
+        if (p[4][1] != OUT_CTRL_FD) {
+            dup2(p[4][1], OUT_CTRL_FD);
+            close(p[4][1]);
+        }
+
         close(p[0][1]);
         close(p[1][0]);
-        close(p[2][1]);
-        close(p[3][0]);
+        close(p[2][0]);
+        close(p[3][1]);
+        close(p[4][0]);
 
         /* Reset buffering on the new descriptors */
         setlinebuf(stdin);
         setlinebuf(stdout);
-        setlinebuf(stderr);
+        setvbuf(stderr, NULL, _IONBF, 0);
 
-        nlua_thread(p[2][0], p[3][1], project, filename);
+        nlua_thread(p[3][0], p[4][1], project, filename);
         exit(0);
     }
 
     close(p[0][0]);
     close(p[1][1]);
-    close(p[2][0]);
-    close(p[3][1]);
+    close(p[2][1]);
+    close(p[3][0]);
+    close(p[4][1]);
 
     /* We're running as parent process */
     nlua_states[thread_id].in_fd    = p[0][1];
     nlua_states[thread_id].out_fd   = p[1][0];
-    nlua_states[thread_id].in_ctrl  = p[2][1];
-    nlua_states[thread_id].out_ctrl = p[3][0];
+    nlua_states[thread_id].err_fd   = p[2][0];
+    nlua_states[thread_id].in_ctrl  = p[3][1];
+    nlua_states[thread_id].out_ctrl = p[4][0];
 
     return thread_id;
 }
@@ -846,14 +996,11 @@ determine_lua_operation(char *cmd, char *token, char *arg)
     else if(!strcmp(cmd, "bpadd"))
         return LUA_BPADD;
 
-    else if(!strcmp(cmd, "ping"))
-        return LUA_PING;
-
     else if(!strcmp(cmd, "state"))
         return LUA_STATE;
 
-    else if(!strcmp(cmd, "stdio"))
-        return LUA_STDIO;
+    else if(!strcmp(cmd, "webio"))
+        return LUA_WEBIO;
 
     else if(!strcmp(cmd, "run"))
         return LUA_RUN;
@@ -907,22 +1054,15 @@ handle_lua_uri(FCGX_Request *request)
                                    "OK\n");
     }
 
-    else if (lo == LUA_STDIO) {
-        int timeout = DEFAULT_STDIO_TIMEOUT;
+    else if (lo == LUA_WEBIO) {
         id = strtoul(token, NULL, 0);
         if (id > MAX_THREAD_ID)
             return make_error(request, "Invalid thread ID specified", EINVAL);
 
-        if (*arg) {
-            timeout = strtoul(arg, NULL, 0);
-            if (timeout < 0 || timeout > MAX_STDIO_TIMEOUT)
-                timeout = DEFAULT_STDIO_TIMEOUT;
-        }
-
         if (!nlua_pool_status[id])
             return make_error(request, "Thread not running", EINVAL);
 
-        return nlua_stdio(request, arg, id, timeout);
+        return nlua_webio(request, arg, id);
     }
 
     else if (lo == LUA_LIST) {
