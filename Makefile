@@ -15,4 +15,5 @@ clean:
 	$(CC) -c $(CFLAGS) $(MY_CFLAGS) $< -o $@
 
 install: all
-	cp $(EXEC) $(PREFIX)/bin/$(EXEC)
+	install -d $(PREFIX)/bin
+	install -m0755 $(EXEC) $(PREFIX)/bin/$(EXEC)
