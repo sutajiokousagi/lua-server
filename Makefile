@@ -14,3 +14,5 @@ clean:
 .c.o:
 	$(CC) -c $(CFLAGS) $(MY_CFLAGS) $< -o $@
 
+install: all
+	cp $(EXEC) $(PREFIX)/bin/$(EXEC)
